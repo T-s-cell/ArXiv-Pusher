@@ -1,11 +1,14 @@
 import os
+import io
+import re
+import zipfile
 import requests
 from datetime import datetime, timedelta
 from arxiv import Client, Search, SortCriterion, SortOrder
 from PyPDF2 import PdfReader
 import openai
 
-from config import AI_CONFIG, EMAIL_SERVER_CONFIG, GENERAL_CONFIG, USERS_CONFIG, DEFAULT_PROMPT_TEMPLATE
+from config import AI_CONFIG, EMAIL_SERVER_CONFIG, GENERAL_CONFIG, USERS_CONFIG, DEFAULT_PROMPT_TEMPLATE, MINERU_CONFIG
 from database import get_db
 
 import smtplib
@@ -25,8 +28,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 async def send_email(subject, content, receiver_email):
     """发送邮件通知（异步版本）"""
-    # 将Markdown内容转换为HTML
-    html_content = markdown2.markdown(content, extras=["tables", "latex", "fenced-code-blocks"])
+    # 将Markdown内容转换为HTML；个别总结可能含非法 LaTeX（如双下标）导致
+    # latex2mathml 抛异常，此时退化为不渲染公式的转换，保证邮件仍能发出
+    try:
+        html_content = markdown2.markdown(content, extras=["tables", "latex", "fenced-code-blocks"])
+    except Exception as e:
+        logger.warning(f"LaTeX 公式渲染失败({type(e).__name__})，退化为无公式渲染: {str(e)[:100]}")
+        html_content = markdown2.markdown(content, extras=["tables", "fenced-code-blocks"])
     msg = MIMEText(html_content, "html", "utf-8")
     msg["Subject"] = subject
     msg["From"] = EMAIL_SERVER_CONFIG["sender"]
@@ -90,14 +98,14 @@ def fetch_papers(arxiv_categories):
     search_query = " OR ".join([f"cat:{cat}" for cat in arxiv_categories])
     client = Client(
         page_size=50,  # 减小每页大小
-        delay_seconds=3,  # 增加请求间隔到3秒，避免被限流
-        num_retries=5  # 增加重试次数
+        delay_seconds=5,  # 请求间隔5秒；2026-10-05 早9点运行曾因HTTP 429中断
+        num_retries=8  # 指数退避重试，覆盖约15分钟，扛住arXiv阶段性限流
     )
     search = Search(
         query=search_query,
         sort_by=SortCriterion.SubmittedDate,
         sort_order=SortOrder.Descending,
-        max_results=100
+        max_results=300
     )
 
     papers = []
@@ -209,6 +217,117 @@ def download_pdf_and_extract_text(paper, user_dir):
         logger.error(f"错误: 无法下载 {paper['title']} 的PDF")
         return ""
 
+def _mineru_agent_extract(pdf_path, cfg):
+    """MinerU Agent 轻量解析（免登录，IP限频；限制≤10MB/约50页，固定轻量模型）"""
+    r = requests.post(
+        "https://mineru.net/api/v1/agent/parse/file",
+        json={
+            "file_name": os.path.basename(pdf_path),
+            "language": cfg.get("language", "en"),
+            "enable_table": True,
+            "enable_formula": True,
+            "is_ocr": False,
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != 0:
+        logger.warning(f"MinerU agent 申请上传链接失败: {d.get('msg')}")
+        return ""
+    task_id, upload_url = d["data"]["task_id"], d["data"]["file_url"]
+
+    with open(pdf_path, 'rb') as f:
+        put = requests.put(upload_url, data=f, timeout=300)
+    if put.status_code != 200:
+        logger.warning(f"MinerU agent 文件上传失败: HTTP {put.status_code}")
+        return ""
+
+    deadline = time.time() + cfg.get("poll_timeout", 300)
+    while time.time() < deadline:
+        time.sleep(cfg.get("poll_interval", 3))
+        q = requests.get(f"https://mineru.net/api/v1/agent/parse/{task_id}", timeout=30)
+        q.raise_for_status()
+        st = q.json().get("data") or {}
+        state = st.get("state")
+        if state == "done":
+            md = requests.get(st["markdown_url"], timeout=60)
+            md.raise_for_status()
+            return md.text
+        if state == "failed":
+            logger.warning(f"MinerU agent 解析失败: {st.get('err_msg')}")
+            return ""
+    logger.warning("MinerU agent 轮询超时")
+    return ""
+
+def _mineru_precise_extract(pdf_path, cfg):
+    """MinerU 精准解析（需 token，≤200MB/200页，每天1000页高优先级额度）"""
+    headers = {"Authorization": f"Bearer {cfg.get('token', '')}"}
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]", "_", os.path.basename(pdf_path))[:100]
+    r = requests.post(
+        "https://mineru.net/api/v4/file-urls/batch",
+        headers=headers,
+        json={
+            "files": [{"name": safe_name, "data_id": safe_name}],
+            "model_version": cfg.get("model_version", "vlm"),
+            "language": cfg.get("language", "en"),
+        },
+        timeout=30,
+    )
+    r.raise_for_status()
+    d = r.json()
+    if d.get("code") != 0:
+        logger.warning(f"MinerU precise 申请上传链接失败: {d.get('msg')}")
+        return ""
+    batch_id, upload_url = d["data"]["batch_id"], d["data"]["file_urls"][0]
+
+    with open(pdf_path, 'rb') as f:
+        put = requests.put(upload_url, data=f, timeout=300)
+    if put.status_code != 200:
+        logger.warning(f"MinerU precise 文件上传失败: HTTP {put.status_code}")
+        return ""
+
+    deadline = time.time() + cfg.get("poll_timeout", 300)
+    while time.time() < deadline:
+        time.sleep(cfg.get("poll_interval", 3))
+        q = requests.get(f"https://mineru.net/api/v4/extract-results/batch/{batch_id}", headers=headers, timeout=30)
+        q.raise_for_status()
+        data = q.json().get("data") or {}
+        items = data.get("extract_result") or ([data] if data.get("state") else [])
+        item = items[0] if items else {}
+        state = item.get("state")
+        if state == "done":
+            zip_resp = requests.get(item["full_zip_url"], timeout=120)
+            zip_resp.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(zip_resp.content)) as zf:
+                md_names = [n for n in zf.namelist() if n.endswith("full.md")]
+                if not md_names:
+                    logger.warning("MinerU precise 结果包中未找到 full.md")
+                    return ""
+                return zf.read(md_names[0]).decode("utf-8", errors="replace")
+        if state == "failed":
+            logger.warning(f"MinerU precise 解析失败: {item.get('err_msg')}")
+            return ""
+    logger.warning("MinerU precise 轮询超时")
+    return ""
+
+def mineru_extract_text(pdf_path, paper_title=""):
+    """MinerU 云端解析入口：配置了 token 走精准解析 API，否则走免登录 Agent 轻量 API。
+    返回 markdown 文本；任何失败返回空串（调用方回退到 PyPDF2 本地提取）。"""
+    try:
+        cfg = MINERU_CONFIG
+        if not cfg.get("enabled", True):
+            return ""
+        if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) < 1000:
+            return ""
+        logger.info(f"MinerU 云端解析: {os.path.basename(pdf_path)[:60]}...")
+        if cfg.get("token", ""):
+            return _mineru_precise_extract(pdf_path, cfg)
+        return _mineru_agent_extract(pdf_path, cfg)
+    except Exception as e:
+        logger.warning(f"MinerU 解析异常，将回退本地提取: {type(e).__name__}: {str(e)[:150]}")
+        return ""
+
 def download_html_and_extract_text(paper, user_dir):
     """从arxiv下载HTML版本，保存为PDF，然后提取文本"""
     try:
@@ -270,9 +389,30 @@ def download_html_and_extract_text(paper, user_dir):
         return ""
 
 def get_paper_text(paper, user_dir):
-    """尝试多种方式获取论文文本内容"""
-    # 首先尝试PDF方式
-    text = download_pdf_and_extract_text(paper, user_dir)
+    """尝试多种方式获取论文文本内容
+    pdf_extract_mode: "mineru" 优先 MinerU 云端解析（失败回退 PyPDF2）；"pypdf2" 优先本地提取（失败才上云）"""
+    pdf_path = f"{user_dir}/{paper['title']}.pdf"
+    if not (os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000):
+        if not download_pdf(paper['pdf_url'], pdf_path):
+            logger.error(f"错误: 无法下载 {paper['title']} 的PDF")
+
+    mode = GENERAL_CONFIG.get("pdf_extract_mode", "mineru")
+    text = ""
+    if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 1000:
+        if mode == "pypdf2":
+            text = extract_text_from_pdf(pdf_path, paper)
+            if not text or len(text) < 1000:
+                mineru_text = mineru_extract_text(pdf_path, paper.get('title', ''))
+                if len(mineru_text) > len(text or ""):
+                    text = mineru_text
+        else:
+            text = mineru_extract_text(pdf_path, paper.get('title', ''))
+            if not text or len(text) < 1000:
+                pypdf2_text = extract_text_from_pdf(pdf_path, paper)
+                if len(pypdf2_text) > len(text or ""):
+                    text = pypdf2_text
+        if not text:
+            logger.warning(f"警告: 无法从 {paper['title']} 提取文本")
 
     # 如果PDF方式失败，尝试HTML方式
     if not text or len(text) < 1000:  # 内容太少可能是提取失败
@@ -300,21 +440,44 @@ def gpt_check_interest(abstract, interest_filter_prompt):
     """
     prompt = interest_filter_prompt.format(abstract=abstract)
 
-    client = openai.OpenAI(
-        base_url=AI_CONFIG["base_url"],
-        api_key=AI_CONFIG["api_key"]
-    )
-
     logger.info(f"检查论文兴趣度...")
+    # 依次尝试主过滤端点与备用端点（如本地部署模型宕机时回退到云端按量模型）；
+    # timeout/max_retries 保证端点挂起时快速失败，避免拖死整个运行
+    endpoints = [(
+        AI_CONFIG.get("filter_base_url", AI_CONFIG["base_url"]),
+        AI_CONFIG.get("filter_api_key", AI_CONFIG["api_key"]),
+        AI_CONFIG.get("filter_model", AI_CONFIG["model"]),
+    )]
+    backup = (
+        AI_CONFIG.get("backup_filter_base_url"),
+        AI_CONFIG.get("backup_filter_api_key"),
+        AI_CONFIG.get("backup_filter_model"),
+    )
+    if all(backup):
+        endpoints.append(backup)
+
+    response = None
+    last_err = None
+    for base_url, api_key, model in endpoints:
+        try:
+            client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=60.0, max_retries=1)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }],
+                temperature=AI_CONFIG.get("filter_temperature", 0.3),  # 降低温度以获得更一致的判断
+                extra_body={"thinking": {"type": "enabled" if AI_CONFIG.get("filter_thinking", True) else "disabled"}},  # 思考模式提升判定质量，可经AI_CONFIG.filter_thinking关闭
+            )
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(f"过滤端点 {base_url} (模型 {model}) 调用失败: {str(e)}")
+
     try:
-        response = client.chat.completions.create(
-            model=AI_CONFIG["model"],
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }],
-            temperature=0.3,  # 降低温度以获得更一致的判断
-        )
+        if response is None:
+            raise last_err
 
         # 记录token使用情况
         usage = response.usage
@@ -325,22 +488,19 @@ def gpt_check_interest(abstract, interest_filter_prompt):
         }
         logger.info(f"Token使用 - 输入: {usage.prompt_tokens}, 输出: {usage.completion_tokens}, 总计: {usage.total_tokens}")
 
-        answer = response.choices[0].message.content.strip().lower()
-        logger.info(f"兴趣判断结果: {answer}")
+        answer = (response.choices[0].message.content or "").strip().upper()
+        logger.info(f"兴趣判断结果: {answer[:50]}")
 
-        # 判断AI回复是否表示感兴趣
-        # 支持多种可能的回答形式
-        interested = any(keyword in answer for keyword in ['是', 'yes', '感兴趣', '有兴趣', 'interested'])
-        not_interested = any(keyword in answer for keyword in ['否', 'no', '不感兴趣', '无兴趣', 'not interested'])
-
-        if interested and not not_interested:
+        # 提示词要求模型只输出 Y/N；取回答中出现的首个 Y/N 字符判定
+        first = next((ch for ch in answer if ch in ("Y", "N")), None)
+        if first == "Y":
             return True, token_stats
-        elif not_interested and not interested:
+        if first == "N":
             return False, token_stats
-        else:
-            # 如果无法明确判断，默认为感兴趣（保守策略）
-            logger.warning(f"无法明确判断兴趣，默认为感兴趣。AI回复: {answer}")
-            return True, token_stats
+
+        # 无法解析时默认保留（保守策略），实际应极少发生
+        logger.warning(f"无法解析过滤回答，默认保留。AI回复: {answer[:100]}")
+        return True, token_stats
 
     except Exception as e:
         logger.error(f"兴趣判断失败: {str(e)}，默认为感兴趣")
@@ -352,27 +512,53 @@ def gpt_summarize(text, custom_prompt=None):
     Returns:
         tuple: (str, dict) 第一个元素为总结内容，第二个元素为token使用统计
     """
+    # PyPDF2 从部分 PDF 抽取的文本可能含未配对代理字符，会让 HTTP 请求序列化直接失败
+    text = text.encode('utf-8', errors='replace').decode('utf-8')
+
     # 如果没有自定义提示词，使用默认模板
     if custom_prompt:
         prompt = custom_prompt.format(text=text)
     else:
         prompt = DEFAULT_PROMPT_TEMPLATE.format(text=text)
 
-    client = openai.OpenAI(
-        base_url=AI_CONFIG["base_url"],
-        api_key=AI_CONFIG["api_key"]
-    )
-
     logger.info(f"Requesting GPT to summarize: {text[:100]}...")
     logger.info(f"Request length: {len(text)}")
-    response = client.chat.completions.create(
-        model=AI_CONFIG["model"],
-        messages=[{
-            "role": "user",
-            "content": prompt
-        }],
-        temperature=1.5,
+    # 依次尝试主总结端点与备用端点（如本地部署模型不可用时回退到云端模型）
+    endpoints = [(
+        AI_CONFIG.get("summarize_base_url", AI_CONFIG["base_url"]),
+        AI_CONFIG.get("summarize_api_key", AI_CONFIG["api_key"]),
+        AI_CONFIG.get("summarize_model", AI_CONFIG["model"]),
+    )]
+    backup = (
+        AI_CONFIG.get("backup_summarize_base_url"),
+        AI_CONFIG.get("backup_summarize_api_key"),
+        AI_CONFIG.get("backup_summarize_model"),
     )
+    if all(backup):
+        endpoints.append(backup)
+
+    response = None
+    last_err = None
+    for base_url, api_key, model in endpoints:
+        try:
+            client = openai.OpenAI(base_url=base_url, api_key=api_key, timeout=1200.0, max_retries=1)
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{
+                    "role": "user",
+                    "content": prompt
+                }],
+                temperature=AI_CONFIG.get("temperature", 1.5),
+                max_tokens=8192,  # 本地思维链模型思维+正文共用该上限
+            )
+            break
+        except Exception as e:
+            last_err = e
+            logger.warning(f"总结端点 {base_url} (模型 {model}) 调用失败: {str(e)}")
+
+    if response is None:
+        logger.error(f"总结请求失败: {last_err}")
+        return f"论文总结生成失败：{last_err}", {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
 
     # 记录token使用情况
     usage = response.usage
@@ -383,20 +569,10 @@ def gpt_summarize(text, custom_prompt=None):
     }
     logger.info(f"Token使用 - 输入: {usage.prompt_tokens}, 输出: {usage.completion_tokens}, 总计: {usage.total_tokens}")
 
-    logger.info(f"Response: {response.choices[0].message.content[:100]}...")
-    logger.info(f"Response length: {len(response.choices[0].message.content)}")
-
-    # Remove any code blocks from the response
-    content = response.choices[0].message.content
-    cleaned_content = ""
-    in_code_block = False
-    for line in content.split('\n'):
-        if line.startswith('```'):
-            in_code_block = not in_code_block
-            continue
-        if not in_code_block:
-            cleaned_content += line + '\n'
-    return response.choices[0].message.content, token_stats
+    content = response.choices[0].message.content or ""
+    logger.info(f"Response: {content[:100]}...")
+    logger.info(f"Response length: {len(content)}")
+    return content, token_stats
 
 def _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
                     generate_input_tokens, generate_output_tokens):
@@ -609,20 +785,17 @@ def process_user(user_config):
 
     report = []
     papers_processed_count = 0
-    for paper in papers:
-        try:
-            # 下载并处理PDF
-            text = get_paper_text(paper, user_dir)
 
-            # GPT总结（使用用户自定义提示词）
-            summary, token_stats = gpt_summarize(text, custom_prompt)
-            # 累计生成阶段token使用
-            generate_input_tokens += token_stats['prompt_tokens']
-            generate_output_tokens += token_stats['completion_tokens']
-            papers_processed_count += 1
+    def _summarize_paper(paper):
+        """下载全文并生成单篇总结，返回报告片段"""
+        # 下载并处理PDF
+        text = get_paper_text(paper, user_dir)
 
-            # 构建报告
-            report.append(f"""
+        # GPT总结（使用用户自定义提示词）
+        summary, token_stats = gpt_summarize(text, custom_prompt)
+
+        # 构建报告
+        return token_stats, f"""
 ## 📄论文标题
 
 {paper['title']}
@@ -642,10 +815,27 @@ def process_user(user_config):
 {summary}
 
 {'─' * 80}
-""")
-        except Exception as e:
-            logger.error(f"处理论文失败: {paper['title']}，错误: {str(e)}")
-            report.append(f"处理论文失败: {paper['title']}，错误: {str(e)}")
+"""
+
+    # 并发下载+总结（本地推理模型单篇耗时较长，靠并发压总时长；token统计回主线程累加）
+    summarize_workers = GENERAL_CONFIG.get("summarize_workers", 3)
+    section_by_idx = {}
+    with ThreadPoolExecutor(max_workers=summarize_workers) as executor:
+        futures = {executor.submit(_summarize_paper, p): i for i, p in enumerate(papers)}
+        for future in as_completed(futures):
+            i = futures[future]
+            paper = papers[i]
+            try:
+                token_stats, section = future.result()
+                section_by_idx[i] = section
+                # 累计生成阶段token使用
+                generate_input_tokens += token_stats['prompt_tokens']
+                generate_output_tokens += token_stats['completion_tokens']
+                papers_processed_count += 1
+            except Exception as e:
+                logger.error(f"处理论文失败: {paper['title']}，错误: {str(e)}")
+                section_by_idx[i] = f"处理论文失败: {paper['title']}，错误: {str(e)}"
+    report.extend(section_by_idx[i] for i in sorted(section_by_idx))
 
     # 输出用户的token使用统计和成本
     _log_token_cost(user_name, filter_input_tokens, filter_output_tokens,
@@ -688,14 +878,14 @@ def process_user(user_config):
         if filtered_out_papers:
             full_report += "\n\n" + build_filtered_papers_appendix(filtered_out_papers)
 
-        # 发送给该用户
-        asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", full_report, user_email))
-
-        # 保存报告到用户专属文件
+        # 先保存报告到用户专属文件（若后置则发送环节崩溃会丢失全部总结结果）
         report_file = f"{user_dir}/report.md"
         with open(report_file, 'w', encoding='utf-8') as f:
             f.write(full_report)
-        logger.success(f"用户 {user_name} 的报告已发送并保存到 {report_file}")
+
+        # 发送给该用户
+        asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", full_report, user_email))
+        logger.success(f"用户 {user_name} 的报告已保存到 {report_file}")
 
 def daily_job():
     """每日任务：为所有配置的用户处理论文"""
@@ -710,8 +900,8 @@ def daily_job():
             if i < len(USERS_CONFIG) - 1:
                 logger.info(f"等待60秒后处理下一个用户，避免API限流...")
                 time.sleep(60)
-        except Exception as e:
-            logger.error(f"处理用户 {user_config['name']} 时发生错误: {str(e)}")
+        except Exception:
+            logger.exception(f"处理用户 {user_config['name']} 时发生错误")
 
     logger.success("所有用户处理完成")
 
@@ -719,12 +909,12 @@ def run_scheduler():
     scheduler = BlockingScheduler()
     scheduler.add_job(
         daily_job, 
-        trigger=CronTrigger(hour=16, minute=0),  # 每天下午4点运行
+        trigger=CronTrigger(hour=9, minute=0),  # 每天上午9点运行（arXiv新论文北京时间约8点公布，9点可抓到当天最新批次）
         id='daily_arxiv_job',
         name='Daily ArXiv paper collection and summary'
     )
     
-    logger.info("定时任务已设置，每天下午4:00运行")
+    logger.info("定时任务已设置，每天上午9:00运行")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

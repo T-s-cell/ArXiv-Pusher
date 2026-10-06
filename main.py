@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import json
 import zipfile
 import requests
 from datetime import datetime, timedelta
@@ -92,8 +93,30 @@ def _send_email_sync(msg, server=None, receiver_email=None):
                 logger.warning(f"关闭SMTP连接时发生错误: {str(e)}")
 
 
+WATERMARK_PATH = "watermark.json"
+_last_fetch_max_published = None  # 最近一次 fetch 看到的最大 published 时间（UTC naive）
+
+
+def _load_watermark():
+    """读取上次已处理论文的最大发表时间（UTC naive）；文件不存在或损坏返回 None"""
+    try:
+        with open(WATERMARK_PATH, encoding="utf-8") as f:
+            v = json.load(f).get("last_published_utc")
+        return datetime.strptime(v, "%Y-%m-%dT%H:%M:%S") if v else None
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def _save_watermark(dt):
+    with open(WATERMARK_PATH, "w", encoding="utf-8") as f:
+        json.dump({"last_published_utc": dt.strftime("%Y-%m-%dT%H:%M:%S")}, f)
+
+
 def fetch_papers(arxiv_categories):
-    """获取指定分类的论文"""
+    """获取指定分类的论文
+    过滤逻辑用水位线增量：arXiv API 索引比公布晚数小时、且周末批次的 v1 日期跨多天，
+    固定取"昨天"会漏论文（2026-10-06 事故），故记录已处理的最大 published 时间，
+    每次只取其之后的新论文；无水位线（首次运行）时回退为按回溯天数取上一工作日。"""
     # 构建搜索查询，只包含配置中的主题
     search_query = " OR ".join([f"cat:{cat}" for cat in arxiv_categories])
     client = Client(
@@ -109,33 +132,45 @@ def fetch_papers(arxiv_categories):
     )
 
     papers = []
-    # Get the target date (previous workday)
-    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    target_date = today - timedelta(days=GENERAL_CONFIG["days_lookback"])
+    global _last_fetch_max_published
+    _last_fetch_max_published = None
+    watermark = _load_watermark()
+    if watermark is not None:
+        logger.info(f"增量模式：只取 published 晚于 {watermark} (UTC) 的论文")
+    else:
+        # Get the target date (previous workday)
+        today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+        target_date = today - timedelta(days=GENERAL_CONFIG["days_lookback"])
 
-    # Adjust if yesterday was a weekend
-    weekday = target_date.weekday()  # 0-6, where 5 is Saturday and 6 is Sunday
-    if weekday >= 5:  # If Saturday or Sunday
-        # Go back to Friday (4)
-        target_date -= timedelta(days=weekday - 4)
+        # Adjust if yesterday was a weekend
+        weekday = target_date.weekday()  # 0-6, where 5 is Saturday and 6 is Sunday
+        if weekday >= 5:  # If Saturday or Sunday
+            # Go back to Friday (4)
+            target_date -= timedelta(days=weekday - 4)
 
-    logger.info(f"Target date set to previous workday: {target_date.strftime('%Y-%m-%d')}")
+        logger.info(f"首次运行（无水位线），Target date set to previous workday: {target_date.strftime('%Y-%m-%d')}")
     for result in client.results(search):
         logger.info(f"Processing paper: {result.title} published on {result.published}")
-        # Check if the paper was published on the target date
         published_dt = result.published.replace(tzinfo=None)
-        if target_date <= published_dt :
-            papers.append({
-                "title": result.title,
-                "url": result.entry_id,
-                "pdf_url": result.pdf_url,
-                "abstract": result.summary,
-                "authors": [a.name for a in result.authors],
-                "published": result.published,
-                "categories": [c for c in result.categories],
-                "primary_category": result.primary_category if result.primary_category else None
-            })
-    logger.success(f"Found {len(papers)} papers published from {target_date.strftime('%Y-%m-%d')}")
+        if watermark is not None:
+            if published_dt <= watermark:
+                continue
+        elif published_dt < target_date:
+            continue
+        if _last_fetch_max_published is None or published_dt > _last_fetch_max_published:
+            _last_fetch_max_published = published_dt
+        papers.append({
+            "title": result.title,
+            "url": result.entry_id,
+            "pdf_url": result.pdf_url,
+            "abstract": result.summary,
+            "authors": [a.name for a in result.authors],
+            "published": result.published,
+            "categories": [c for c in result.categories],
+            "primary_category": result.primary_category if result.primary_category else None
+        })
+    since = watermark.strftime('%Y-%m-%d %H:%M') if watermark is not None else target_date.strftime('%Y-%m-%d')
+    logger.success(f"Found {len(papers)} papers published after {since} (UTC)")
     return papers
 
 def download_pdf(url, filename, max_retries=3):
@@ -887,6 +922,11 @@ def process_user(user_config):
         asyncio.run(send_email(f"每日ArXiv论文报告 - {user_name}", full_report, user_email))
         logger.success(f"用户 {user_name} 的报告已保存到 {report_file}")
 
+        # 发送成功后才推进水位线（严格大于，避免重复处理）；中途崩溃则下次重发同一批
+        if _last_fetch_max_published is not None:
+            _save_watermark(_last_fetch_max_published)
+            logger.info(f"水位线更新至 {_last_fetch_max_published} (UTC)")
+
 def daily_job():
     """每日任务：为所有配置的用户处理论文"""
     os.makedirs('temp', exist_ok=True)
@@ -909,12 +949,13 @@ def run_scheduler():
     scheduler = BlockingScheduler()
     scheduler.add_job(
         daily_job, 
-        trigger=CronTrigger(hour=9, minute=0),  # 每天上午9点运行（arXiv新论文北京时间约8点公布，9点可抓到当天最新批次）
+        # arXiv 早上8点(北京)公布的批次，API 索引约滞后6~8小时，14点后才可查，故下午4点运行抓当天批次
+        trigger=CronTrigger(hour=16, minute=0),
         id='daily_arxiv_job',
         name='Daily ArXiv paper collection and summary'
     )
     
-    logger.info("定时任务已设置，每天上午9:00运行")
+    logger.info("定时任务已设置，每天下午16:00运行")
     try:
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):

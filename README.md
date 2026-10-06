@@ -247,7 +247,7 @@ USERS_CONFIG = [
 uv run main.py
 ```
 
-程序将在每天上午 9:00 自动执行任务（可在 `main.py` 的 `run_scheduler()` 修改 `CronTrigger` 的时间；arXiv 新论文于北京时间每天早上 8:00 左右公布）。
+程序将在每天下午 16:00 自动执行任务（可在 `main.py` 的 `run_scheduler()` 修改 `CronTrigger` 的时间；arXiv 新论文于北京时间每天早上 8:00 左右公布，但 API 索引滞后约 6~8 小时，下午运行才能抓到当天批次）。
 
 ### 2. 立即执行一次（测试用）
 如需立即执行，取消 `main.py` 末尾的注释：

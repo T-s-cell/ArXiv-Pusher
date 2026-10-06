@@ -10,7 +10,7 @@ ArXiv Pusher — a scheduled bot that fetches new arXiv papers daily, optionally
 
 ```bash
 uv sync                                       # install dependencies (Python 3.12, managed by uv)
-uv run main.py                                # start blocking scheduler (daily 09:00, CronTrigger in run_scheduler())
+uv run main.py                                # start blocking scheduler (daily 16:00, CronTrigger in run_scheduler())
 uv run test_email.py                          # manually email the repo-root report.md as a test
 uv run query_usage.py --summary               # token/cost summary for all users
 uv run query_usage.py --user "组名" --days 7   # per-user usage over last N days
